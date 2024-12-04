@@ -135,7 +135,10 @@ def calculate_reward(next_obs):
         reward -= 100
 
     # 거리 기반 보상
-    distance_to_goal = np.linalg.norm([next_obs["observation"][0][0], next_obs["observation"][0][1]] - [next_obs["goal_spot"][0], next_obs["goal_spot"][1]])
+    distance_to_goal = np.linalg.norm(
+        np.array([next_obs["observation"][0][0], next_obs["observation"][0][1]]) - 
+        np.array([next_obs["goal_spot"][0], next_obs["goal_spot"][1]])
+    )
     reward -= distance_to_goal * 0.1
 
     return reward
