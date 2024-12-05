@@ -134,10 +134,6 @@ class RoadHogRLAgent(RoadHogAgent):
                 q_values = self.policy_net.forward(state_tensor)
             action = q_values.argmax(dim=1).item()
 
-        # Decay epsilon during training
-        if training:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
         return action
     
     # Process the observation into a single state vector
