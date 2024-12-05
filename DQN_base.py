@@ -2,8 +2,12 @@ import numpy as np
 import torch
 import torch.optim as optim
 import random
+import pickle
+import time
 from collections import deque
 from knu_rl_env.road_hog import RoadHogAgent, make_road_hog, evaluate
+
+filename = "dqn_1205"
 
 # Hyperparameters
 GAMMA = 0.99          # Discount factor
@@ -13,8 +17,8 @@ MEMORY_SIZE = 10000   # Replay memory size
 EPSILON_START = 1.0   # Initial epsilon for ε-greedy policy
 EPSILON_END = 0.01    # Minimum epsilon
 EPSILON_DECAY = 0.995 # Decay rate for epsilon
-TARGET_UPDATE_FREQ = 10 # Frequency to update target network
-MAX_EPISODES = 500    # Maximum number of episodes to train
+TARGET_UPDATE_FREQ = 20 # Frequency to update target network
+MAX_EPISODES = 300    # Maximum number of episodes to train
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -95,21 +99,47 @@ class cAdam:
                 param.grad.zero_()
 
 class RoadHogRLAgent(RoadHogAgent):
-    def __init__(self, policy_net):
+    def __init__(self, policy_net, action_space_size, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
         self.policy_net = policy_net
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.action_space_size = action_space_size
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
 
-    def act(self, state):
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            q_values = self.policy_net.forward(state_tensor)
-        action = q_values.argmax(dim=1).item()
+    def act(self, state, training=True):
+        """
+        Select an action based on ε-greedy policy.
+        During training, ε-greedy is applied.
+        During evaluation, the best action is chosen deterministically.
+        """
+        # If state is a dictionary, process it
+        if isinstance(state, dict):
+            state = self.process_state(
+                state["observation"],
+                state["goal_spot"],
+                state["is_on_load"],
+                state["is_crashed"],
+                state["time"]
+            )
+
+        if training and random.random() < self.epsilon:
+            # Random exploration
+            action = random.randint(0, self.action_space_size - 1)
+        else:
+            # Exploitation (best action)
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.policy_net.forward(state_tensor)
+            action = q_values.argmax(dim=1).item()
+
         return action
-
-# Process the observation into a single state vector
-def process_state(observation, goal_spot, is_on_load, is_crashed, time):
-    observation_vector = observation.flatten()
-    return np.concatenate([observation_vector, goal_spot, [is_on_load, is_crashed, time]])
+    
+    # Process the observation into a single state vector
+    def process_state(self, observation, goal_spot, is_on_load, is_crashed, time):
+        observation_vector = observation.flatten()
+        return np.concatenate([observation_vector, goal_spot, [is_on_load, is_crashed, time]])
 
 # 가중치 복사
 def copy_weights(source, target):
@@ -124,11 +154,11 @@ def relu(x):
 def calculate_reward(next_obs):
     reward = 0
     
-    print(next_obs)
+    # print(next_obs)
 
     # 도로 바깥으로 벗어나면 패널티
     if not next_obs["is_on_load"]:
-        reward -= 10
+        reward -= 100
 
     # 충돌 시 패널티
     if next_obs["is_crashed"]:
@@ -139,15 +169,13 @@ def calculate_reward(next_obs):
         np.array([next_obs["observation"][0][0], next_obs["observation"][0][1]]) - 
         np.array([next_obs["goal_spot"][0], next_obs["goal_spot"][1]])
     )
-    reward -= distance_to_goal * 0.1
+    reward -= distance_to_goal * 0.2
 
     return reward
 
 # Training loop
 def train():
-    env = make_road_hog(
-        show_screen=True
-    )
+    env = make_road_hog(show_screen=False)
     
     obs_space_size = 10 * 6 + 6 + 3  # observation (10x6), goal_spot (6), extra info (3: is_on_load, is_crashed, time)
     action_space_size = 9            # Number of actions
@@ -159,45 +187,43 @@ def train():
 
     # Initialize optimizer
     optimizer = cAdam(policy_net.parameters(), lr=LEARNING_RATE)
-    
     memory = ReplayMemory(MEMORY_SIZE)
-    epsilon = EPSILON_START
-    
-    agent = RoadHogRLAgent(policy_net)
 
+    agent = RoadHogRLAgent(policy_net, action_space_size)
+
+    print("start!")
+    start_time = time.time()
     for episode in range(MAX_EPISODES):
-        obs = env.reset()   ## reset -> return only 2-dim array, pass
+        obs = env.reset()
         next_obs, _, terminated, truncated, _ = env.step(RoadHogAgent.NON_ACCEL_NEUTRAL)
-        state = process_state(
+
+        # Process initial state using agent's process_state method
+        state = agent.process_state(
             next_obs["observation"],
             next_obs["goal_spot"],
             next_obs["is_on_load"],
             next_obs["is_crashed"],
             next_obs["time"]
         )
-        state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-
         total_reward = 0
         done = False
 
         while not done:
-            # Epsilon-greedy action selection
-            if random.random() < epsilon:
-                action = random.randint(0, action_space_size - 1)
-            else:
-                with torch.no_grad():
-                    action = agent.policy_net.forward(state).argmax(dim=1).item()
+            # Use ε-greedy policy from `act` method
+            action = agent.act(state, training=True)
 
             next_obs, _, terminated, truncated, _ = env.step(action)
             reward = calculate_reward(next_obs)
-            next_state = process_state(
+
+            # Process next state using agent's process_state method
+            next_state = agent.process_state(
                 next_obs["observation"],
                 next_obs["goal_spot"],
                 next_obs["is_on_load"],
                 next_obs["is_crashed"],
                 next_obs["time"]
             )
-            next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
+
             if terminated or truncated:
                 done = True
 
@@ -211,14 +237,14 @@ def train():
                 transitions = memory.sample(BATCH_SIZE)
                 batch = list(zip(*transitions))
 
-                state_batch = torch.cat(batch[0]).to(device)
-                action_batch = torch.tensor(batch[1], dtype=torch.long).unsqueeze(1).to(device)
-                reward_batch = torch.tensor(batch[2], dtype=torch.float32).unsqueeze(1).to(device)
-                next_state_batch = torch.cat(batch[3]).to(device)
-                done_batch = torch.tensor(batch[4], dtype=torch.float32).unsqueeze(1).to(device)
+                state_batch = torch.tensor(np.array(batch[0]), dtype=torch.float32).to(device)
+                action_batch = torch.tensor(np.array(batch[1]), dtype=torch.long).unsqueeze(1).to(device)
+                reward_batch = torch.tensor(np.array(batch[2]), dtype=torch.float32).unsqueeze(1).to(device)
+                next_state_batch = torch.tensor(np.array(batch[3]), dtype=torch.float32).to(device)
+                done_batch = torch.tensor(np.array(batch[4]), dtype=torch.float32).unsqueeze(1).to(device)
 
                 # Q-learning update
-                q_values = agent.policy_net.forward(state_batch).gather(1, action_batch)
+                q_values = policy_net.forward(state_batch).gather(1, action_batch)
                 next_q_values = target_net.forward(next_state_batch).max(1)[0].unsqueeze(1).detach()
                 expected_q_values = reward_batch + (1 - done_batch) * GAMMA * next_q_values
 
@@ -228,22 +254,50 @@ def train():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
+                
         # Update target network
         if episode % TARGET_UPDATE_FREQ == 0:
             copy_weights(agent.policy_net, target_net)
 
         # Decay epsilon
-        epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+        agent.epsilon = max(EPSILON_END, agent.epsilon * EPSILON_DECAY)
 
         # Periodic logging
         if episode % 10 == 0:
-            print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {epsilon:.3f}")
+            print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.3f}")
+            
+        if episode % 100 == 0:
+            with open(f'{filename}_{episode}.pickle', 'wb') as fw:
+                pickle.dump(agent, fw)
 
+    print("done")
+    end_time = time.time()
+    
     env.close()
+    
+    elapsed_time = end_time - start_time
+    print(f"학습에 걸린 시간: {elapsed_time:.2f}초")
+    
+    ## save agent
+    with open(f'{filename}.pickle', 'wb') as fw:
+        pickle.dump(agent, fw)
+    
     return agent
+
+def load(filename):
+    try:
+        with open(f'{filename}.pickle', 'rb') as fr:
+            agent = pickle.load(fr)
+        return agent
+    except FileNotFoundError:
+        print(f"Error: File '{filename}.pickle' not found.")
+        return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
 
 if __name__ == '__main__':
     agent = train()
+    # agent = load('dqn_test')
     evaluate(agent)
     # run_manual()
