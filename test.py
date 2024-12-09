@@ -15,6 +15,6 @@ def load(filename):
         return None
 
 if __name__ == '__main__':
-    agent = load('dqn_1205')
+    agent = load('ddqn_test')
     evaluate(agent)
     # run_manual()
