@@ -188,6 +188,8 @@ def train():
     # Initialize optimizer
     optimizer = cAdam(policy_net.parameters(), lr=LEARNING_RATE)
     memory = ReplayMemory(MEMORY_SIZE)
+    
+    losses = []
 
     agent = RoadHogRLAgent(policy_net, action_space_size)
 
@@ -249,6 +251,7 @@ def train():
                 expected_q_values = reward_batch + (1 - done_batch) * GAMMA * next_q_values
 
                 loss = ((q_values - expected_q_values) ** 2).mean()
+                losses.append(loss.item())
 
                 # Optimize model
                 optimizer.zero_grad()
@@ -262,9 +265,14 @@ def train():
         # Decay epsilon
         agent.epsilon = max(EPSILON_END, agent.epsilon * EPSILON_DECAY)
 
+        if len(losses) > 0:
+            avg_loss = np.mean(losses[-len(memory):])
+        else:
+            avg_loss = 0
+        
         # Periodic logging
         if episode % 10 == 0:
-            print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.3f}")
+            print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.3f}, Avg Loss: {avg_loss:.4f}")
             
         if episode % 100 == 0:
             with open(f'{filename}_{episode}.pickle', 'wb') as fw:
