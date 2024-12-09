@@ -1,13 +1,12 @@
 import numpy as np
 import torch
-import torch.optim as optim
 import random
 import pickle
 import time
 from collections import deque
 from knu_rl_env.road_hog import RoadHogAgent, make_road_hog, evaluate
 
-filename = "dqn_1205"
+filename = "ddqn_jebal"
 
 # Hyperparameters
 GAMMA = 0.99          # Discount factor
@@ -18,7 +17,7 @@ EPSILON_START = 1.0   # Initial epsilon for ε-greedy policy
 EPSILON_END = 0.01    # Minimum epsilon
 EPSILON_DECAY = 0.995 # Decay rate for epsilon
 TARGET_UPDATE_FREQ = 20 # Frequency to update target network
-MAX_EPISODES = 300    # Maximum number of episodes to train
+MAX_EPISODES = 1000    # Maximum number of episodes to train
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -151,26 +150,47 @@ def relu(x):
     return torch.maximum(x, torch.zeros_like(x))
 
 # Calculate reward about next observation
-def calculate_reward(next_obs):
+def calculate_ingame_reward(next_obs):
     reward = 0
     
     # print(next_obs)
 
     # 도로 바깥으로 벗어나면 패널티
     if not next_obs["is_on_load"]:
-        reward -= 100
+        reward -= 5
 
     # 충돌 시 패널티
     if next_obs["is_crashed"]:
-        reward -= 100
+        reward -= 20
 
     # 거리 기반 보상
     distance_to_goal = np.linalg.norm(
         np.array([next_obs["observation"][0][0], next_obs["observation"][0][1]]) - 
         np.array([next_obs["goal_spot"][0], next_obs["goal_spot"][1]])
     )
-    reward -= distance_to_goal * 0.2
+    reward -= distance_to_goal * 0.05
 
+    return reward
+
+def calculate_final_reward(obs):
+    reward = 0
+    time = obs["time"]
+    distance_to_goal = np.linalg.norm(
+        np.array([obs["observation"][0][0], obs["observation"][0][1]]) - 
+        np.array([obs["goal_spot"][0], obs["goal_spot"][1]])
+    )
+    if distance_to_goal < 2:
+        reward += 10000
+        
+    if time < 120:
+        reward += 50000
+        print("Success")
+    
+    ## failure
+    if time >= 120 and distance_to_goal > 2:
+        reward -= 10000
+        reward += distance_to_goal*10
+        print("failure")
     return reward
 
 # Training loop
@@ -195,7 +215,7 @@ def train():
 
     print("start!")
     start_time = time.time()
-    for episode in range(MAX_EPISODES):
+    for episode in range(1, MAX_EPISODES+1):
         obs = env.reset()
         next_obs, _, terminated, truncated, _ = env.step(RoadHogAgent.NON_ACCEL_NEUTRAL)
 
@@ -215,7 +235,7 @@ def train():
             action = agent.act(state, training=True)
 
             next_obs, _, terminated, truncated, _ = env.step(action)
-            reward = calculate_reward(next_obs)
+            reward = calculate_ingame_reward(next_obs)
 
             # Process next state using agent's process_state method
             next_state = agent.process_state(
@@ -228,6 +248,7 @@ def train():
 
             if terminated or truncated:
                 done = True
+                reward += calculate_final_reward(next_obs)
 
             # Store transition in memory
             memory.push((state, action, reward, next_state, done))
@@ -245,9 +266,15 @@ def train():
                 next_state_batch = torch.tensor(np.array(batch[3]), dtype=torch.float32).to(device)
                 done_batch = torch.tensor(np.array(batch[4]), dtype=torch.float32).unsqueeze(1).to(device)
 
-                # Q-learning update
+                # Q-learning update for Double DQN
                 q_values = policy_net.forward(state_batch).gather(1, action_batch)
-                next_q_values = target_net.forward(next_state_batch).max(1)[0].unsqueeze(1).detach()
+
+                # Use policy_net to choose next action
+                next_actions = policy_net.forward(next_state_batch).argmax(1, keepdim=True)
+
+                # Use target_net to evaluate the value of the chosen action
+                next_q_values = target_net.forward(next_state_batch).gather(1, next_actions).detach()
+
                 expected_q_values = reward_batch + (1 - done_batch) * GAMMA * next_q_values
 
                 loss = ((q_values - expected_q_values) ** 2).mean()
@@ -272,7 +299,7 @@ def train():
         
         # Periodic logging
         if episode % 10 == 0:
-            print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.3f}, Avg Loss: {avg_loss:.4f}")
+            print(f"Episode {episode}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.3f}, Avg Loss: {avg_loss:.4f}")
             
         if episode % 100 == 0:
             with open(f'{filename}_{episode}.pickle', 'wb') as fw:
@@ -307,5 +334,5 @@ def load(filename):
 if __name__ == '__main__':
     agent = train()
     # agent = load('dqn_test')
-    evaluate(agent)
+    # evaluate(agent)
     # run_manual()

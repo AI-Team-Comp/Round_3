@@ -15,7 +15,7 @@ EPSILON_START = 1.0   # Initial epsilon for ε-greedy policy
 EPSILON_END = 0.01    # Minimum epsilon
 EPSILON_DECAY = 0.995 # Decay rate for epsilon
 TARGET_UPDATE_FREQ = 10 # Frequency to update target network
-MAX_EPISODES = 500    # Maximum number of episodes to train
+MAX_EPISODES = 10    # Maximum number of episodes to train
 
 # Neural network for DQN
 class DQN(nn.Module):
@@ -51,6 +51,8 @@ def process_state(observation, goal_spot, is_on_load, is_crashed, time):
     observation_vector = observation.flatten()
     return np.concatenate([observation_vector, goal_spot, [is_on_load, is_crashed, time]])
 
+import time
+
 # Training loop
 def train_dqn():
     env = road_hog.make_road_hog(show_screen=False)
@@ -67,6 +69,8 @@ def train_dqn():
     optimizer = optim.Adam(policy_net.parameters(), lr=LEARNING_RATE)
     memory = ReplayMemory(MEMORY_SIZE)
     epsilon = EPSILON_START
+
+    start_time = time.time()  # Start time measurement
 
     for episode in range(MAX_EPISODES):
         # Reset environment and take an initial step
@@ -141,9 +145,14 @@ def train_dqn():
 
         print(f"Episode {episode + 1}/{MAX_EPISODES}, Total Reward: {total_reward:.2f}, Epsilon: {epsilon:.3f}")
 
+    end_time = time.time()  # End time measurement
+    elapsed_time = end_time - start_time  # Calculate elapsed time
+    print(f"Training completed in {elapsed_time:.2f} seconds.")
+
     env.close()
     return policy_net
 
 # Train the agent
 trained_policy = train_dqn()
+
 

@@ -1,13 +1,11 @@
 import numpy as np
 import torch
-import torch.optim as optim
 import random
 import pickle
 import time
-from collections import deque
 from knu_rl_env.road_hog import RoadHogAgent, make_road_hog, evaluate
 
-filename = "dqn_1205"
+filename = "ddqn_test"
 
 # Hyperparameters
 GAMMA = 0.99          # Discount factor
@@ -45,19 +43,46 @@ class cDQN:
     def parameters(self):
         return [self.weights1, self.bias1, self.weights2, self.bias2, self.weights3, self.bias3]
 
-# Replay memory
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
+# Prioritized Experience Replay memory
+class PrioritizedReplayMemory:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.memory = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.position = 0
     
-    def push(self, transition):
-        self.memory.append(transition)
+    def push(self, transition, td_error):
+        max_priority = self.priorities.max() if self.memory else 1.0
+        if len(self.memory) < self.capacity:
+            self.memory.append(transition)
+        else:
+            self.memory[self.position] = transition
+        
+        self.priorities[self.position] = max_priority if td_error is None else (abs(td_error) + 1e-5)
+        self.position = (self.position + 1) % self.capacity
     
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+    def sample(self, batch_size, beta=0.4):
+        if len(self.memory) == self.capacity:
+            priorities = self.priorities
+        else:
+            priorities = self.priorities[:len(self.memory)]
+        
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+        
+        indices = np.random.choice(len(self.memory), batch_size, p=probs)
+        samples = [self.memory[idx] for idx in indices]
+        
+        total = len(self.memory)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        
+        return samples, indices, weights
     
-    def __len__(self):
-        return len(self.memory)
+    def update_priorities(self, indices, td_errors):
+        for idx, td_error in zip(indices, td_errors):
+            self.priorities[idx] = abs(td_error) + 1e-5
 
 # optimizer
 class cAdam:
@@ -151,26 +176,45 @@ def relu(x):
     return torch.maximum(x, torch.zeros_like(x))
 
 # Calculate reward about next observation
-def calculate_reward(next_obs):
+def calculate_ingame_reward(next_obs):
     reward = 0
     
     # print(next_obs)
 
     # 도로 바깥으로 벗어나면 패널티
     if not next_obs["is_on_load"]:
-        reward -= 100
+        reward -= 10
 
     # 충돌 시 패널티
     if next_obs["is_crashed"]:
-        reward -= 100
+        reward -= 50
 
     # 거리 기반 보상
     distance_to_goal = np.linalg.norm(
         np.array([next_obs["observation"][0][0], next_obs["observation"][0][1]]) - 
         np.array([next_obs["goal_spot"][0], next_obs["goal_spot"][1]])
     )
-    reward -= distance_to_goal * 0.2
+    reward -= distance_to_goal * 0.1
 
+    return reward
+
+def calculate_final_reward(obs):
+    reward = 0
+    time = obs["time"]
+    distance_to_goal = np.linalg.norm(
+        np.array([obs["observation"][0][0], obs["observation"][0][1]]) - 
+        np.array([obs["goal_spot"][0], obs["goal_spot"][1]])
+    )
+    if distance_to_goal < 2:
+        reward += 50000
+        
+    if time < 120:
+        reward += 50000
+    
+    ## failure
+    if time >= 120 and distance_to_goal > 2:
+        reward -= 30000
+        print("failure")
     return reward
 
 # Training loop
@@ -187,7 +231,7 @@ def train():
 
     # Initialize optimizer
     optimizer = cAdam(policy_net.parameters(), lr=LEARNING_RATE)
-    memory = ReplayMemory(MEMORY_SIZE)
+    memory = PrioritizedReplayMemory(MEMORY_SIZE)
     
     losses = []
 
@@ -215,7 +259,7 @@ def train():
             action = agent.act(state, training=True)
 
             next_obs, _, terminated, truncated, _ = env.step(action)
-            reward = calculate_reward(next_obs)
+            reward = calculate_ingame_reward(next_obs)
 
             # Process next state using agent's process_state method
             next_state = agent.process_state(
@@ -236,7 +280,7 @@ def train():
 
             # Experience replay
             if len(memory) >= BATCH_SIZE:
-                transitions = memory.sample(BATCH_SIZE)
+                transitions, indices, weights = memory.sample(BATCH_SIZE)
                 batch = list(zip(*transitions))
 
                 state_batch = torch.tensor(np.array(batch[0]), dtype=torch.float32).to(device)
@@ -245,18 +289,28 @@ def train():
                 next_state_batch = torch.tensor(np.array(batch[3]), dtype=torch.float32).to(device)
                 done_batch = torch.tensor(np.array(batch[4]), dtype=torch.float32).unsqueeze(1).to(device)
 
-                # Q-learning update
+                # Q-learning update for Double DQN
                 q_values = policy_net.forward(state_batch).gather(1, action_batch)
-                next_q_values = target_net.forward(next_state_batch).max(1)[0].unsqueeze(1).detach()
+                next_actions = policy_net.forward(next_state_batch).argmax(1, keepdim=True)
+                next_q_values = target_net.forward(next_state_batch).gather(1, next_actions).detach()
                 expected_q_values = reward_batch + (1 - done_batch) * GAMMA * next_q_values
 
-                loss = ((q_values - expected_q_values) ** 2).mean()
+                td_errors = (q_values - expected_q_values).detach().cpu().numpy().squeeze()
+                loss = (torch.tensor(weights, dtype=torch.float32).to(device) * (q_values - expected_q_values).pow(2)).mean()
+                
+                # tracking errors
                 losses.append(loss.item())
 
                 # Optimize model
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                
+                memory.update_priorities(indices, td_errors)
+                
+        if done:
+            total_reward += calculate_final_reward(next_obs)
+            # print(next_obs)
                 
         # Update target network
         if episode % TARGET_UPDATE_FREQ == 0:
